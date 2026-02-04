@@ -1,13 +1,13 @@
 # Node.js with Playwright support
-FROM mcr.microsoft.com/playwright:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright:v1.50.0-jammy
 
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install dependencies and ensure browsers are installed
+RUN npm ci --only=production && npx playwright install chromium
 
 # Copy source code
 COPY . .
