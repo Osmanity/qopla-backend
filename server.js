@@ -74,6 +74,40 @@ app.post('/api/scrape', async (req, res) => {
   });
 });
 
+app.post('/api/scrape-turbo', async (req, res) => {
+  const { url, imageSize = 'medium' } = req.body;
+  
+  if (!url || !url.includes('qopla.com')) {
+    return res.status(400).json({ error: 'Ogiltig Qopla URL' });
+  }
+
+  const validSizes = ['small', 'medium', 'large', 'original'];
+  if (!validSizes.includes(imageSize)) {
+    return res.status(400).json({ error: 'Ogiltig bildstorlek' });
+  }
+
+  const sessionId = Date.now().toString();
+  activeSessions.set(sessionId, { 
+    status: 'starting', 
+    progress: 0, 
+    total: 0, 
+    images: [],
+    imageBuffers: new Map(),
+    createdAt: Date.now()
+  });
+
+  res.json({ sessionId, message: 'Turbo-hämtning startad' });
+
+  scrapeQoplaImagesTurbo(url, sessionId, imageSize).catch(err => {
+    console.error('Turbo scraping error:', err);
+    const session = activeSessions.get(sessionId);
+    if (session) {
+      session.status = 'error';
+      session.error = err.message;
+    }
+  });
+});
+
 app.get('/api/progress/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId);
   if (!session) {
@@ -304,6 +338,193 @@ async function scrapeQoplaImages(url, sessionId) {
         console.log(`Error on product ${i + 1}: ${err.message}`);
         await page.keyboard.press('Escape').catch(() => {});
       }
+    }
+    
+    session.status = 'completed';
+    session.images = downloadedImages;
+    
+  } catch (error) {
+    session.status = 'error';
+    session.error = error.message;
+  } finally {
+    await browser.close();
+  }
+}
+
+// Transform S3 URL to desired size
+function transformS3Url(imageUrl, targetSize) {
+  // Match S3 URL pattern: https://s3-eu-west-1.amazonaws.com/qopla/{id}/Gallery/{size}/{filename}
+  const s3Pattern = /^(https:\/\/s3[^\/]*\.amazonaws\.com\/qopla\/[^\/]+\/Gallery\/)(small|medium|large|original)(\/.+)$/;
+  const match = imageUrl.match(s3Pattern);
+  
+  if (match) {
+    return `${match[1]}${targetSize}${match[3]}`;
+  }
+  
+  // Also try without Gallery path - some images might have different structure
+  const s3PatternAlt = /^(https:\/\/s3[^\/]*\.amazonaws\.com\/qopla\/[^\/]+\/)(small|medium|large|original)(\/.+)$/;
+  const matchAlt = imageUrl.match(s3PatternAlt);
+  
+  if (matchAlt) {
+    return `${matchAlt[1]}${targetSize}${matchAlt[3]}`;
+  }
+  
+  return imageUrl;
+}
+
+// Extract product name from various sources
+function extractProductName(card, index) {
+  return card.evaluate((el, idx) => {
+    // Try to find product name in common patterns
+    const nameSelectors = [
+      'h1', 'h2', 'h3', 'h4',
+      '[class*="name"]', '[class*="title"]', '[class*="heading"]',
+      'span:first-child', 'p:first-child'
+    ];
+    
+    for (const selector of nameSelectors) {
+      const nameEl = el.querySelector(selector);
+      if (nameEl) {
+        const text = nameEl.textContent.trim();
+        // Filter out prices and invalid names
+        if (text.length > 2 && text.length < 100 && !text.match(/^\d+\s*kr$/)) {
+          return text;
+        }
+      }
+    }
+    
+    // Try text content of the card itself
+    const text = el.textContent.trim();
+    const firstLine = text.split('\n')[0].trim();
+    if (firstLine.length > 2 && firstLine.length < 80 && !firstLine.match(/^\d+\s*kr$/)) {
+      return firstLine;
+    }
+    
+    return `product_${idx + 1}`;
+  }, index);
+}
+
+async function scrapeQoplaImagesTurbo(url, sessionId, imageSize) {
+  const session = activeSessions.get(sessionId);
+  session.status = 'launching';
+  
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  
+  try {
+    session.status = 'navigating';
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    await page.waitForTimeout(2000);
+    
+    const urlMatch = url.match(/restaurant\/([^\/]+)\//);
+    const restaurantName = urlMatch ? urlMatch[1].replace(/-/g, '_') : 'restaurant';
+    session.restaurantName = restaurantName;
+    
+    session.status = 'extracting_urls';
+    
+    // Find all product cards with images
+    const productCards = await page.$$('article, [data-testid*="product"], .product-card, div[role="button"], button');
+    
+    const imageData = [];
+    const seenUrls = new Set();
+    
+    // Extract all image URLs from the page without clicking
+    for (let i = 0; i < productCards.length; i++) {
+      try {
+        const card = productCards[i];
+        const imgs = await card.$$('img');
+        
+        for (const img of imgs) {
+          try {
+            let imageUrl = await img.getAttribute('src');
+            const srcset = await img.getAttribute('srcset');
+            
+            // Prefer srcset for higher quality
+            if (srcset) {
+              const srcsetUrls = srcset.split(',').map(s => s.trim().split(' ')[0]);
+              // Get the largest one
+              imageUrl = srcsetUrls[srcsetUrls.length - 1] || imageUrl;
+            }
+            
+            if (!imageUrl || imageUrl.startsWith('data:')) continue;
+            if (!imageUrl.startsWith('http')) {
+              imageUrl = new URL(imageUrl, url).href;
+            }
+            
+            // Only process S3 bucket URLs
+            if (!imageUrl.includes('amazonaws.com/qopla')) continue;
+            
+            // Transform to desired size
+            const transformedUrl = transformS3Url(imageUrl, imageSize);
+            
+            if (seenUrls.has(transformedUrl)) continue;
+            seenUrls.add(transformedUrl);
+            
+            // Get product name
+            const altText = await img.getAttribute('alt') || '';
+            const productName = await extractProductName(card, i) || altText || `product_${i + 1}`;
+            
+            imageData.push({
+              url: transformedUrl,
+              productName,
+              originalUrl: imageUrl
+            });
+            
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+    
+    session.total = imageData.length;
+    session.status = 'downloading_turbo';
+    
+    const downloadedImages = [];
+    
+    // Download all images in parallel batches
+    const batchSize = 5;
+    for (let i = 0; i < imageData.length; i += batchSize) {
+      const batch = imageData.slice(i, i + batchSize);
+      
+      const results = await Promise.allSettled(
+        batch.map(async (data, batchIdx) => {
+          const idx = i + batchIdx;
+          try {
+            const buffer = await downloadImageToBuffer(data.url);
+            
+            const cleanName = data.productName
+              .replace(/[<>:"/\\|?*]/g, '')
+              .replace(/\s+/g, '_')
+              .replace(/_{2,}/g, '_')
+              .substring(0, 80)
+              .trim();
+            
+            const ext = data.url.includes('.png') ? '.png' : '.jpg';
+            const filename = cleanName ? `${cleanName}${ext}` : `product_${idx + 1}${ext}`;
+            
+            session.imageBuffers.set(filename, buffer);
+            
+            return { 
+              filename, 
+              productName: data.productName,
+              imagePath: `/api/image/${sessionId}/${encodeURIComponent(filename)}`
+            };
+          } catch (err) {
+            console.log(`Failed to download ${data.url}: ${err.message}`);
+            return null;
+          }
+        })
+      );
+      
+      // Add successful downloads
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          downloadedImages.push(result.value);
+          console.log(`⚡ Turbo downloaded: ${result.value.filename}`);
+        }
+      }
+      
+      session.progress = Math.min(i + batchSize, imageData.length);
+      session.images = downloadedImages;
     }
     
     session.status = 'completed';
