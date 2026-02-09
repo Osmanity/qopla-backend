@@ -4,10 +4,18 @@ import { chromium } from 'playwright';
 import archiver from 'archiver';
 import https from 'https';
 import http from 'http';
+import multer from 'multer';
+import sharp from 'sharp';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Multer setup for file uploads (store in memory)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 } // max 50MB per file upload
+});
 
 const activeSessions = new Map();
 
@@ -537,6 +545,271 @@ async function scrapeQoplaImagesTurbo(url, sessionId, imageSize) {
     await browser.close();
   }
 }
+
+// ==========================================
+// IMAGE COMPRESSION ENDPOINTS
+// ==========================================
+
+const compressSessions = new Map();
+
+// Compress a single image buffer to target max size (in bytes)
+async function compressImageToTarget(buffer, targetBytes, originalName) {
+  const metadata = await sharp(buffer).metadata();
+  const format = metadata.format; // jpeg, png, webp, etc.
+
+  // If already under target, return as-is
+  if (buffer.length <= targetBytes) {
+    return { buffer, format: format || 'jpeg', alreadySmall: true };
+  }
+
+  // Strategy: iteratively reduce quality for JPEG/WebP, or convert PNG to JPEG
+  let outputFormat = (format === 'png') ? 'png' : 'jpeg';
+  let quality = 95;
+  let result = buffer;
+  let width = metadata.width;
+
+  // First try reducing quality
+  while (quality >= 10) {
+    let pipeline = sharp(buffer);
+
+    if (outputFormat === 'jpeg') {
+      pipeline = pipeline.jpeg({ quality, mozjpeg: true });
+    } else if (outputFormat === 'png') {
+      pipeline = pipeline.png({ quality: Math.max(quality, 20), compressionLevel: 9 });
+    }
+
+    result = await pipeline.toBuffer();
+
+    if (result.length <= targetBytes) {
+      return { buffer: result, format: outputFormat, quality };
+    }
+
+    quality -= 5;
+  }
+
+  // If PNG is still too large, convert to JPEG
+  if (outputFormat === 'png') {
+    outputFormat = 'jpeg';
+    quality = 90;
+    while (quality >= 10) {
+      result = await sharp(buffer).jpeg({ quality, mozjpeg: true }).toBuffer();
+      if (result.length <= targetBytes) {
+        return { buffer: result, format: 'jpeg', quality, converted: true };
+      }
+      quality -= 5;
+    }
+  }
+
+  // Last resort: reduce dimensions step by step
+  let scale = 0.9;
+  while (scale >= 0.1) {
+    const newWidth = Math.round(width * scale);
+    result = await sharp(buffer)
+      .resize(newWidth)
+      .jpeg({ quality: 60, mozjpeg: true })
+      .toBuffer();
+
+    if (result.length <= targetBytes) {
+      return { buffer: result, format: 'jpeg', quality: 60, resized: true, scale };
+    }
+    scale -= 0.1;
+  }
+
+  // Return the smallest we could get
+  return { buffer: result, format: 'jpeg', quality: 60, resized: true };
+}
+
+// POST /api/compress - compress a single image
+app.post('/api/compress', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Ingen bild uppladdad' });
+    }
+
+    const targetMB = parseFloat(req.body.targetMB) || 5;
+    const targetBytes = targetMB * 1024 * 1024;
+
+    const originalSize = req.file.size;
+    const originalName = req.file.originalname;
+
+    const { buffer, format, alreadySmall } = await compressImageToTarget(
+      req.file.buffer,
+      targetBytes,
+      originalName
+    );
+
+    const sessionId = `compress_${Date.now()}`;
+    // Keep original filename as-is
+    const filename = originalName;
+
+    compressSessions.set(sessionId, {
+      buffer,
+      filename,
+      format,
+      originalSize,
+      compressedSize: buffer.length,
+      createdAt: Date.now()
+    });
+
+    // Clean up old compress sessions after 30 min
+    setTimeout(() => compressSessions.delete(sessionId), 30 * 60 * 1000);
+
+    res.json({
+      sessionId,
+      filename,
+      originalSize,
+      compressedSize: buffer.length,
+      alreadySmall: !!alreadySmall
+    });
+  } catch (err) {
+    console.error('Compress error:', err);
+    res.status(500).json({ error: 'Kunde inte komprimera bilden: ' + err.message });
+  }
+});
+
+// GET /api/compress/download/:sessionId - download compressed single image
+app.get('/api/compress/download/:sessionId', (req, res) => {
+  const session = compressSessions.get(req.params.sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session hittades inte' });
+  }
+
+  const contentType = session.format === 'png' ? 'image/png' : 'image/jpeg';
+  res.set('Content-Type', contentType);
+  res.set('Content-Disposition', `attachment; filename="${session.filename}"`);
+  res.send(session.buffer);
+});
+
+// POST /api/compress-batch - compress multiple images (from folder upload)
+app.post('/api/compress-batch', upload.array('images', 200), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'Inga bilder uppladdade' });
+    }
+
+    const targetMB = parseFloat(req.body.targetMB) || 5;
+    const targetBytes = targetMB * 1024 * 1024;
+
+    const sessionId = `batch_${Date.now()}`;
+    const batchSession = {
+      status: 'processing',
+      total: req.files.length,
+      processed: 0,
+      results: [],
+      imageBuffers: new Map(),
+      createdAt: Date.now()
+    };
+    compressSessions.set(sessionId, batchSession);
+
+    // Clean up after 30 min
+    setTimeout(() => compressSessions.delete(sessionId), 30 * 60 * 1000);
+
+    // Return session ID immediately
+    res.json({ sessionId, total: req.files.length });
+
+    // Parse relative paths sent from frontend (for folder structure in ZIP)
+    let relativePaths = [];
+    try {
+      if (req.body.relativePaths) {
+        relativePaths = JSON.parse(req.body.relativePaths);
+      }
+    } catch (e) {}
+
+    // Process in background
+    (async () => {
+      for (let i = 0; i < req.files.length; i++) {
+        const file = req.files[i];
+        try {
+          const { buffer, format } = await compressImageToTarget(
+            file.buffer,
+            targetBytes,
+            file.originalname
+          );
+
+          // Use relative path if available, otherwise just the original filename
+          const relativePath = relativePaths[i] || file.originalname;
+          const filename = relativePath;
+
+          batchSession.imageBuffers.set(filename, buffer);
+          batchSession.results.push({
+            filename,
+            originalName: file.originalname,
+            originalSize: file.size,
+            compressedSize: buffer.length,
+            imagePath: `/api/compress/preview/${sessionId}/${encodeURIComponent(filename)}`
+          });
+        } catch (err) {
+          batchSession.results.push({
+            filename: file.originalname,
+            originalName: file.originalname,
+            originalSize: file.size,
+            error: err.message
+          });
+        }
+        batchSession.processed = i + 1;
+      }
+      batchSession.status = 'completed';
+    })();
+  } catch (err) {
+    console.error('Batch compress error:', err);
+    res.status(500).json({ error: 'Kunde inte komprimera bilderna: ' + err.message });
+  }
+});
+
+// GET /api/compress/batch-progress/:sessionId - poll batch progress
+app.get('/api/compress/batch-progress/:sessionId', (req, res) => {
+  const session = compressSessions.get(req.params.sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session hittades inte' });
+  }
+
+  const { imageBuffers, ...safeSession } = session;
+  res.json(safeSession);
+});
+
+// GET /api/compress/preview/:sessionId/:filename - preview a compressed image
+app.get('/api/compress/preview/:sessionId/:filename', (req, res) => {
+  const session = compressSessions.get(req.params.sessionId);
+  if (!session || !session.imageBuffers) {
+    return res.status(404).json({ error: 'Session hittades inte' });
+  }
+
+  const buffer = session.imageBuffers.get(decodeURIComponent(req.params.filename));
+  if (!buffer) {
+    return res.status(404).json({ error: 'Bilden hittades inte' });
+  }
+
+  const ext = req.params.filename.split('.').pop().toLowerCase();
+  const contentType = ext === 'png' ? 'image/png' : 'image/jpeg';
+  res.set('Content-Type', contentType);
+  res.send(buffer);
+});
+
+// GET /api/compress/batch-download/:sessionId - download all as ZIP
+app.get('/api/compress/batch-download/:sessionId', (req, res) => {
+  const session = compressSessions.get(req.params.sessionId);
+  if (!session || !session.imageBuffers || session.imageBuffers.size === 0) {
+    return res.status(404).json({ error: 'Inga bilder att ladda ner' });
+  }
+
+  const archive = archiver('zip', { zlib: { level: 9 } });
+
+  res.set('Content-Type', 'application/zip');
+  res.set('Content-Disposition', 'attachment; filename="komprimerade_bilder.zip"');
+
+  archive.pipe(res);
+
+  for (const [filename, buffer] of session.imageBuffers) {
+    archive.append(buffer, { name: filename });
+  }
+
+  archive.finalize();
+
+  archive.on('end', () => {
+    compressSessions.delete(req.params.sessionId);
+    console.log(`Compress session ${req.params.sessionId} rensad efter nedladdning`);
+  });
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
